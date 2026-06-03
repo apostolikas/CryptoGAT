@@ -2,3 +2,4 @@ venv/
 *.md
 *.csv
 demo.*
+*.txt
