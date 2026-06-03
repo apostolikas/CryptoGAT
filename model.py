@@ -1,79 +1,85 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import RGATConv
+from torch_geometric.nn import GATv2Conv
+
+
+class CausalConv1d(nn.Module):
+    """Strictly causal 1D convolution (no future leakage)."""
+
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=self.padding, dilation=dilation)
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x[:, :, :-self.padding] if self.padding > 0 else x
+
 
 class TCNNodeEncoder(nn.Module):
     def __init__(self, in_channels, hidden_channels):
-        super(TCNNodeEncoder, self).__init__()
-        # 1D Convolution over time axis (Seq_Len)
-        self.conv1 = nn.Conv1d(in_channels, hidden_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, padding=1)
-        
+        super().__init__()
+        self.conv1 = CausalConv1d(in_channels, hidden_channels, kernel_size=3)
+        self.conv2 = CausalConv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=2)
+
     def forward(self, x):
-        # x input shape: (Num_Nodes, Seq_Len, Features)
-        x = x.transpose(1, 2) # Transpose to (Num_Nodes, Features, Seq_Len) for Conv1d engine
+        # x: (N, Seq_Len, Features)
+        x = x.transpose(1, 2)            # (N, Features, Seq_Len)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
-        # Temporal pooling over the lookback horizon window steps
-        x_out = x.mean(dim=-1) # Output matrix shape: (Num_Nodes, Hidden_Channels)
-        return x_out
+        return x[:, :, -1]               # latest causal state -> (N, H)
+
 
 class RGATModel(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int, num_relations: int, out_channels: int, 
-                 num_heads: int = 4, num_layers: int = 2, edge_dim: int = 10): 
-        super(RGATModel, self).__init__()
-        
+    """Spatio-temporal GNN.
+
+    Architectural lightening: instead of a stack of heavy RGATConv layers (one
+    attention mechanism per relation), we fold the discrete relation type into a
+    one-hot appended to the continuous edge attributes and use a single
+    relation-aware GATv2Conv per layer. Same relational expressiveness at a
+    fraction of the parameters / FLOPs.
+    """
+
+    def __init__(self, in_channels: int, hidden_channels: int, num_relations: int,
+                 out_channels: int = 7, num_heads: int = 4, num_layers: int = 2,
+                 edge_dim: int = 11):
+        super().__init__()
         self.num_layers = num_layers
-        
-        # 1. Temporal Memory Encoder (TCN)
+        self.num_relations = num_relations
+        self.edge_in_dim = edge_dim + num_relations   # continuous + one-hot relation
+
         self.tcn = TCNNodeEncoder(in_channels, hidden_channels)
-        
-        # 2. Input Projection & Normalization
         self.input_proj = nn.Linear(hidden_channels, hidden_channels)
         self.feature_dropout = nn.Dropout(0.2)
-        
-        # 3. Dynamic RGAT Layers with Residuals and LayerNorm
+
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
-        
         for _ in range(num_layers):
-            # FIX: By setting concat=False, the multi-head outputs are averaged.
-            # This forces output node geometries to stay strictly at hidden_channels dimension width
-            self.convs.append(RGATConv(hidden_channels, hidden_channels, num_relations=num_relations, 
-                                       heads=num_heads, concat=False, edge_dim=edge_dim))
+            self.convs.append(GATv2Conv(hidden_channels, hidden_channels, heads=num_heads,
+                                        concat=False, edge_dim=self.edge_in_dim, add_self_loops=False))
             self.norms.append(nn.LayerNorm(hidden_channels))
-            
-        # 4. Multi-horizon prediction projection layer
+
         self.ffn = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_channels, out_channels)
+            nn.Linear(hidden_channels, out_channels),
         )
-        
+
+    def _edge_features(self, edge_attr, edge_type):
+        onehot = F.one_hot(edge_type, num_classes=self.num_relations).to(edge_attr.dtype)
+        return torch.cat([edge_attr, onehot], dim=1)
+
     def forward(self, x_seq, edge_index, edge_type, edge_attr=None):
-        """
-        x_seq: Node feature history vector sequence (Num_Nodes, Seq_Len, Features)
-        edge_index: Graph connectivity matrix topology coordinates (2, Edges_Count)
-        edge_type: 1D identifier mapping array for edges (Edges_Count,)
-        edge_attr: 10-dimensional signed alpha feature edge attributes tensor (Edges_Count, 10)
-        """
-        # 1. Compress Temporal sequence dimension using the TCN node encoder
-        h = self.tcn(x_seq) # Output shape matrix: (Num_Nodes, Hidden_Channels)
-        
-        # 2. Apply Linear layer projections and feature regularizations
+        edge_feat = self._edge_features(edge_attr, edge_type)
+
+        h = self.tcn(x_seq)              # (N, H)
         h = self.input_proj(h)
         h = self.feature_dropout(h)
-        
-        # 3. Message Passing Loops
-        # FIX: Keep h as a pure 2D matrix shape (Num_Nodes, Hidden_Channels) to satisfy PyG's indexing check.
+
         for i in range(self.num_layers):
-            h_out = self.convs[i](h, edge_index, edge_type, edge_attr=edge_attr)
-            
-            # LayerNorm and Residual accumulation on flat 2D structures
+            h_out = self.convs[i](h, edge_index, edge_attr=edge_feat)
             h = self.norms[i](h + F.elu(h_out))
-                
-        # 4. Final univariate horizon regression calculation
-        out = self.ffn(h)
-        return out
+
+        return self.ffn(h)               # (N, out_channels)

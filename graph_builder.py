@@ -1,159 +1,196 @@
-import pandas as pd
 import numpy as np
 import torch
 
-def _compute_cross_correlation(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+EPS = 1e-12
+
+# Relation taxonomy (keep in sync with NUM_RELATIONS in train_evaluate.py)
+REL_SELF = 0      # self-loop
+REL_MACRO = 1     # macro future -> equity
+REL_POS = 2       # positive contemporaneous correlation
+REL_NEG = 3       # negative contemporaneous correlation
+REL_LEADLAG = 4   # equity lead-lag
+REL_SECTOR = 5    # same-sector structural edge
+REL_MARKET = 6    # market/index (e.g. QQQ) -> equity
+NUM_RELATIONS = 7
+EDGE_DIM = 11     # number of continuous edge attributes
+
+
+def _demean(x):
+    return x - x.mean(axis=0, keepdims=True)
+
+
+def _xcorr(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Pearson correlation between every column of A and every column of B.
+
+    Returns (Na, Nb): out[i, j] = corr(A[:, i], B[:, j]).
     """
-    Computes the asymmetric cross-correlation matrix between two time-series matrices.
-    A and B must have shape (T_steps, N_assets).
-    Returns shape (N_assets, N_assets) where entry [i, j] is corr(A_i, B_j).
-    """
-    if len(A) < 2:
+    n = A.shape[0]
+    if n < 2:
         return np.zeros((A.shape[1], B.shape[1]))
-        
-    # Mean center
-    A_c = A - np.nanmean(A, axis=0)
-    B_c = B - np.nanmean(B, axis=0)
-    
-    # Covariance
-    cov = (A_c.T @ B_c) / (len(A) - 1)
-    
-    # Standard deviations
-    std_A = np.nanstd(A, axis=0)
-    std_B = np.nanstd(B, axis=0)
-    
-    # Cross-correlation (handling div by zero)
-    denominator = np.outer(std_A, std_B)
-    corr = np.divide(cov, denominator, out=np.zeros_like(cov), where=(denominator != 0))
-    
-    return np.nan_to_num(corr)
+    Ac, Bc = _demean(A), _demean(B)
+    cov = (Ac.T @ Bc) / (n - 1)
+    sa = A.std(axis=0)
+    sb = B.std(axis=0)
+    denom = np.outer(sa, sb)
+    return np.divide(cov, denom, out=np.zeros_like(cov), where=(denom > 0))
 
 
 def compute_rich_dynamic_edges(
-    returns_5m: pd.DataFrame, 
-    returns_30m: pd.DataFrame = None, 
-    node_features_t = None, 
-    threshold: float = 0.1
+    returns_5m: np.ndarray,
+    returns_30m: np.ndarray = None,
+    spread_vec: np.ndarray = None,
+    liq_vec: np.ndarray = None,
+    res_vec: np.ndarray = None,
+    num_equities: int = 0,
+    sector_mask: np.ndarray = None,
+    market_mask: np.ndarray = None,
+    threshold: float = 0.2,
+    top_k: int = 8,
+    macro_lag: int = 5,
 ):
-    """
-    Constructs the dynamic, signed graph for a specific timestamp (A_fast_rolling_t + A_slow_rolling_t).
-    
-    Args:
-        returns_5m: pd.DataFrame of shape (T_5m, N) containing returns for the last 5 minutes.
-        returns_30m: pd.DataFrame of shape (T_30m, N) for the last 30 minutes (optional).
-        node_features_t: pl.DataFrame or pd.DataFrame containing cross-sectional LOB attributes at time t.
-        threshold: Minimum absolute 5m correlation to instantiate an edge.
-    """
-    symbols = returns_5m.columns.tolist()
-    N = len(symbols)
-    
-    # -------------------------------------------------------------------------
-    # 1. 5-Minute Fast Dynamics (Base Correlation & Beta)
-    # -------------------------------------------------------------------------
-    cov_5m = returns_5m.cov().fillna(0).to_numpy()
-    var_5m = returns_5m.var().fillna(1e-12).to_numpy()
-    
-    # Signed and Absolute Correlation
-    corr_signed_5m = returns_5m.corr(method='pearson').fillna(0).to_numpy()
-    corr_abs_5m = np.abs(corr_signed_5m)
-    
-    # Asymmetric Beta: beta[i, j] = Cov(i,j) / Var(j) (Asset i's beta to Asset j)
-    beta_5m = cov_5m / var_5m[None, :] 
-    
-    # Volatility Ratio: vol[i] / vol[j]
-    vol_5m = np.sqrt(var_5m)
-    vol_ratio = vol_5m[:, None] / (vol_5m[None, :] + 1e-12)
+    """Fully vectorized dynamic edge builder.
 
-    # -------------------------------------------------------------------------
-    # 2. 5-Second Lead-Lag Cross-Correlation (Micro-structural leading)
-    # -------------------------------------------------------------------------
-    if len(returns_5m) > 5:
-        ret_t = returns_5m.to_numpy()[5:]
-        ret_t_minus_5 = returns_5m.shift(5).to_numpy()[5:]
-        lead_lag_5s = _compute_cross_correlation(ret_t, ret_t_minus_5)
+    All matrices are indexed [target i, source j]; an edge means j -> i.
+    `returns_*` are dense numpy arrays (T, N) in canonical node order
+    (equities first, then macros). Structural masks are (N, N) booleans.
+    Returns torch tensors (edge_index[2,E], edge_attr[E,EDGE_DIM], edge_type[E]).
+    """
+    R5 = np.asarray(returns_5m, dtype=np.float64)
+    T5, N = R5.shape
+
+    # ---- contemporaneous second-moment statistics (vectorized) -------------
+    var_5m = R5.var(axis=0)
+    var_safe = np.where(var_5m > 0, var_5m, 1e-12)
+    Rc = _demean(R5)
+    cov_5m = (Rc.T @ Rc) / max(T5 - 1, 1)
+    std_5m = np.sqrt(var_safe)
+    denom = np.outer(std_5m, std_5m)
+    corr_signed_5m = np.divide(cov_5m, denom, out=np.zeros_like(cov_5m), where=(denom > 0))
+    corr_abs_5m = np.abs(corr_signed_5m)
+
+    # beta[i, j] = cov(i, j) / var(j): j drives i
+    beta_5m = cov_5m / var_safe[None, :]
+    vol_5m = std_5m
+    vol_ratio = vol_5m[:, None] / (vol_5m[None, :] + EPS)
+
+    # equity lead-lag: corr(ret_i(t), ret_j(t-lag))
+    if T5 > macro_lag + 1:
+        ret_t = R5[macro_lag:]
+        ret_lag = R5[:-macro_lag]
+        lead_lag_5s = _xcorr(ret_t, ret_lag)
     else:
         lead_lag_5s = np.zeros((N, N))
 
-    # -------------------------------------------------------------------------
-    # 3. 30-Minute Slow Dynamics (Macro Regimes)
-    # -------------------------------------------------------------------------
-    if returns_30m is not None and len(returns_30m) > 30:
-        cov_30m = returns_30m.cov().fillna(0).to_numpy()
-        var_30m = returns_30m.var().fillna(1e-12).to_numpy()
-        beta_30m = cov_30m / var_30m[None, :]
-        
-        ret_30m_t = returns_30m.to_numpy()[30:]
-        ret_30m_minus_30 = returns_30m.shift(30).to_numpy()[30:]
-        lead_lag_30s = _compute_cross_correlation(ret_30m_t, ret_30m_minus_30)
+    # lagged macro cross-correlation (lead-lag with liquid proxies):
+    # corr(equity_i(t), macro_j(t-lag)) -- same array, we slice macro cols below
+    macro_leadlag = lead_lag_5s
+
+    # ---- 30m horizon stats -------------------------------------------------
+    if returns_30m is not None:
+        R30 = np.asarray(returns_30m, dtype=np.float64)
+        if R30.shape[0] > 30:
+            var_30 = R30.var(axis=0)
+            var_30s = np.where(var_30 > 0, var_30, 1e-12)
+            R30c = _demean(R30)
+            cov_30 = (R30c.T @ R30c) / (R30.shape[0] - 1)
+            beta_30m = cov_30 / var_30s[None, :]
+            lead_lag_30s = _xcorr(R30[30:], R30[:-30])
+        else:
+            beta_30m, lead_lag_30s = beta_5m, lead_lag_5s
     else:
-        beta_30m = beta_5m
-        lead_lag_30s = lead_lag_5s
+        beta_30m, lead_lag_30s = beta_5m, lead_lag_5s
 
-    # -------------------------------------------------------------------------
-    # 4. Cross-Sectional LOB & Residual State Ratios
-    # -------------------------------------------------------------------------
-    spread_z = np.ones((N, N))
-    liq_ratio = np.ones((N, N))
-    res_z = np.zeros((N, N))
-    
-    if node_features_t is not None:
-        # Handles extraction gracefully whether input is Pandas or Polars
-        if "spread_bps" in node_features_t.columns:
-            spreads = node_features_t["spread_bps"].to_numpy() if hasattr(node_features_t["spread_bps"], "to_numpy") else node_features_t["spread_bps"].values
-            spread_z = spreads[:, None] / (spreads[None, :] + 1e-9)
-            
-        if "top5_book_size" in node_features_t.columns:
-            liqs = node_features_t["top5_book_size"].to_numpy() if hasattr(node_features_t["top5_book_size"], "to_numpy") else node_features_t["top5_book_size"].values
-            liq_ratio = liqs[:, None] / (liqs[None, :] + 1e-9)
-            
-        res_cols = [c for c in node_features_t.columns if "kalman_z_score" in c]
-        if res_cols:
-            res_vals = node_features_t[res_cols[0]].to_numpy() if hasattr(node_features_t[res_cols[0]], "to_numpy") else node_features_t[res_cols[0]].values
-            res_z = res_vals[:, None] - res_vals[None, :]
+    # ---- cross-sectional node modifiers ------------------------------------
+    spread_vec = np.ones(N) if spread_vec is None else np.asarray(spread_vec, dtype=np.float64)
+    liq_vec = np.ones(N) if liq_vec is None else np.asarray(liq_vec, dtype=np.float64)
+    res_vec = np.zeros(N) if res_vec is None else np.asarray(res_vec, dtype=np.float64)
 
-    # -------------------------------------------------------------------------
-    # 5. Graph Assembly & Filtering
-    # -------------------------------------------------------------------------
-    edge_index = []
-    edge_attr = []
-    
-    for i in range(N):
-        for j in range(N):
-            if i != j:
-                if corr_abs_5m[i, j] >= threshold:
-                    attr = [
-                        corr_signed_5m[i, j],
-                        corr_abs_5m[i, j],
-                        beta_5m[i, j],
-                        beta_30m[i, j],
-                        lead_lag_5s[i, j],
-                        lead_lag_30s[i, j],
-                        vol_ratio[i, j],
-                        spread_z[i, j],
-                        liq_ratio[i, j],
-                        res_z[i, j]
-                    ]
-                    edge_index.append([i, j])
-                    edge_attr.append(attr)
+    spread_z = spread_vec[:, None] / (spread_vec[None, :] + 1e-9)
+    liq_ratio = liq_vec[:, None] / (liq_vec[None, :] + 1e-9)
+    res_z = res_vec[:, None] - res_vec[None, :]
 
-    if not edge_index:
-        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 10), dtype=torch.float)
+    # ---- relation assignment (vectorized; later writes win) ----------------
+    rel = np.full((N, N), -1, dtype=np.int64)
+    rel[corr_signed_5m >= threshold] = REL_POS
+    rel[corr_signed_5m <= -threshold] = REL_NEG
+    rel[np.abs(lead_lag_5s) >= threshold] = REL_LEADLAG
 
-    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-    edge_attr = torch.tensor(edge_attr, dtype=torch.float32)
+    if sector_mask is not None:
+        rel[sector_mask] = REL_SECTOR
+    if market_mask is not None:
+        rel[market_mask] = REL_MARKET
+
+    # macro -> equity (source col is macro, target row is equity)
+    col_is_macro = np.arange(N)[None, :] >= num_equities
+    row_is_equity = np.arange(N)[:, None] < num_equities
+    macro_src = col_is_macro & row_is_equity
+    macro_qualify = macro_src & (
+        (corr_abs_5m >= threshold / 2.0) | (np.abs(macro_leadlag) >= threshold / 2.0)
+    )
+    rel[macro_qualify] = REL_MACRO
+
+    np.fill_diagonal(rel, REL_SELF)
+
+    # ---- top-k sparsification of "dense" statistical relations -------------
+    # Keep structural edges (self/macro/sector/market) always; prune only the
+    # correlation / lead-lag edges to the strongest top_k sources per target.
+    if top_k is not None and top_k > 0:
+        score = np.maximum(corr_abs_5m, np.abs(lead_lag_5s))
+        dense_mask = np.isin(rel, (REL_POS, REL_NEG, REL_LEADLAG))
+        for i in range(N):
+            cols = np.flatnonzero(dense_mask[i])
+            if cols.size > top_k:
+                worst = cols[np.argsort(score[i, cols])[:-top_k]]
+                rel[i, worst] = -1
+
+    # ---- materialize edges -------------------------------------------------
+    i_idx, j_idx = np.nonzero(rel >= 0)        # i = target, j = source
+    if i_idx.size == 0:                        # safety: fall back to self loops
+        i_idx = j_idx = np.arange(N)
+        rel[np.arange(N), np.arange(N)] = REL_SELF
+
+    edge_index = np.stack([j_idx, i_idx], axis=0)   # [source, target]
+    edge_type = rel[i_idx, j_idx]
+
+    edge_attr = np.stack([
+        corr_signed_5m[i_idx, j_idx],
+        corr_abs_5m[i_idx, j_idx],
+        beta_5m[i_idx, j_idx],
+        beta_30m[i_idx, j_idx],
+        lead_lag_5s[i_idx, j_idx],
+        lead_lag_30s[i_idx, j_idx],
+        vol_ratio[i_idx, j_idx],
+        spread_z[i_idx, j_idx],
+        liq_ratio[i_idx, j_idx],
+        res_z[i_idx, j_idx],
+        macro_leadlag[i_idx, j_idx],
+    ], axis=1)
+
+    edge_index = torch.from_numpy(edge_index).long().contiguous()
+    edge_attr = torch.from_numpy(edge_attr).float()
+    edge_type = torch.from_numpy(edge_type).long()
     edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=10.0, neginf=-10.0)
+    return edge_index, edge_attr, edge_type
 
-    return edge_index, edge_attr
 
-def build_static_edges(symbols: list, sector_map: dict):
-    edge_index = []
-    for i, sym_i in enumerate(symbols):
-        for j, sym_j in enumerate(symbols):
-            if i != j:
-                if sector_map.get(sym_i) == sector_map.get(sym_j):
-                    edge_index.append([i, j])
-                    
-    if not edge_index:
-        return torch.empty((2, 0), dtype=torch.long)
-        
-    return torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+def build_static_masks(num_equities: int, num_macros: int, sector_groups, market_idx=None):
+    """Precompute the (N, N) sector and market boolean masks once.
+
+    sector_groups: list of lists of equity node indices that share a sector.
+    market_idx: node index of the market/index node (e.g. QQQ), or None.
+    Masks are indexed [target i, source j]; True means an edge j -> i.
+    """
+    n = num_equities + num_macros
+    sector_mask = np.zeros((n, n), dtype=bool)
+    for grp in sector_groups:
+        for i in grp:
+            for j in grp:
+                if i != j:
+                    sector_mask[i, j] = True   # j -> i within sector
+
+    market_mask = np.zeros((n, n), dtype=bool)
+    if market_idx is not None:
+        for i in range(num_equities):
+            if i != market_idx:
+                market_mask[i, market_idx] = True   # market -> equity
+    return sector_mask, market_mask

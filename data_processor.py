@@ -11,6 +11,7 @@ import polars as pl
 # Databento uses this as a sentinel for "no level present"
 MAX_INT_SENTINEL = 9223372036854775807
 
+
 def load_equity_data(pattern: str) -> pl.LazyFrame:
     """
     Load raw MBP-10 Parquet files matching the given glob pattern.
@@ -31,6 +32,7 @@ def load_equity_data(pattern: str) -> pl.LazyFrame:
     )
     return lf
 
+
 def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
     """
     Aggregate raw ticks into 1-second bars per symbol.
@@ -39,13 +41,14 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
     """
     schema_names = lf.collect_schema().names()
 
-    # ── 1. Timestamp conversion ──────────────────────────────────────────
+    # 1. Timestamp conversion
     lf = lf.with_columns(
         pl.from_epoch(pl.col("ts_event"), time_unit="ns").alias("ts_event"),
     )
 
-    # ── 2. Price and Numeric scaling ─────────────────────────────────────
-    # Adjust prices by dividing by 1e-9 (standard Databento format)
+    # 2. Price and Numeric scaling
+    # Databento fixed-point prices are integers scaled by 1e9, so the real
+    # price is (raw * 1e-9). The sentinel marks an empty book level -> null.
     price_cols = [c for c in schema_names if "px" in c or c == "price"]
     if price_cols:
         lf = lf.with_columns([
@@ -58,22 +61,26 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
             for c in price_cols
         ])
 
-    # Cast other requested variables to Float64 so they handle downstream math properly
     numeric_cols = [c for c in ["size", "depth"] if c in schema_names]
     if numeric_cols:
         lf = lf.with_columns([
             pl.col(c).cast(pl.Float64).alias(c) for c in numeric_cols
         ])
 
-    # ── 3. Dynamic 1-second grouping by symbol ───────────────────────────
-    # Dynamically extract depth, size, and price columns plus any level snapshots (px, sz, ct)
+    # 3. Dynamic 1-second grouping by symbol
     additional_preserves = ["depth", "size", "price"]
     snapshot_cols = [
-        c for c in schema_names 
+        c for c in schema_names
         if ("px" in c or "sz" in c or "ct" in c or c in additional_preserves) and c != "ts_event"
     ]
     snapshot_exprs = [pl.col(c).last().alias(c) for c in snapshot_cols]
 
+    # NOTE on Databento trade-side convention (FIX #6):
+    # For Trade ('T') messages, `side` encodes the AGGRESSOR side: 'B' = a buy
+    # aggressor lifting the ask, 'A' = a sell aggressor hitting the bid. The
+    # previous code mapped side=='A' -> buy, which inverted CVD / aggressor
+    # streaks / signed flow. Mapping is now B->buy, A->sell. If your specific
+    # Databento dataset documents the opposite convention, swap these two lines.
     lf_grouped = lf.group_by_dynamic(
         "ts_event", every="1s", by="symbol"
     ).agg([
@@ -83,8 +90,8 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
         pl.col("size").filter((pl.col("action") == "A") & (pl.col("side") == "A")).sum().alias("size_added_ask"),
         pl.col("size").filter((pl.col("action") == "C") & (pl.col("side") == "B")).sum().alias("size_canceled_bid"),
         pl.col("size").filter((pl.col("action") == "C") & (pl.col("side") == "A")).sum().alias("size_canceled_ask"),
-        pl.col("size").filter((pl.col("action") == "T") & (pl.col("side") == "A")).sum().alias("trade_size_buy"),
-        pl.col("size").filter((pl.col("action") == "T") & (pl.col("side") == "B")).sum().alias("trade_size_sell"),
+        pl.col("size").filter((pl.col("action") == "T") & (pl.col("side") == "B")).sum().alias("trade_size_buy"),
+        pl.col("size").filter((pl.col("action") == "T") & (pl.col("side") == "A")).sum().alias("trade_size_sell"),
     ])
 
     df_agg = lf_grouped.collect()
@@ -92,7 +99,7 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
     if len(df_agg) == 0:
         return df_agg
 
-    # ── 4. Fill gaps per symbol on a contiguous 1-second grid ────────────
+    # 4. Fill gaps per symbol on a contiguous 1-second grid
     flow_cols = [
         "msg_count", "size_added_bid", "size_added_ask",
         "size_canceled_bid", "size_canceled_ask",
@@ -107,14 +114,12 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
         min_ts = sym_df["ts_event"].min()
         max_ts = sym_df["ts_event"].max()
 
-        # time_unit="ns" ensures grid types align perfectly to prevent type mismatch crashes on join
         full_grid = pl.DataFrame({
             "ts_event": pl.datetime_range(min_ts, max_ts, "1s", time_unit="ns", eager=True),
         }).with_columns(pl.lit(sym).alias("symbol"))
 
         sym_df = full_grid.join(sym_df, on=["ts_event", "symbol"], how="left")
 
-        # forward_fill handles snapshot_cols, which includes depth, size, and price
         sym_df = sym_df.with_columns([
             pl.col(c).forward_fill() for c in snapshot_cols
         ]).with_columns([
@@ -131,13 +136,19 @@ def engineer_targets(
     df: pl.DataFrame | pl.LazyFrame,
     time_col: str = "ts_event",
     ticker_col: str = "symbol",
-    price_col: str = "price",
+    price_col: str = "mid_price",
     prediction_time_col: str = "predictionTimestamp",
 ) -> pl.DataFrame:
-    """Create forward return targets based on the 1-second price."""
+    """
+    Create forward return targets.
+
+    FIX #1: targets are now built from `mid_price` (the same series all the
+    features are derived from) rather than `price` (the last raw MBP-10 message
+    price in the second, which could be a deep-level update far from the touch).
+    This removes the feature/target inconsistency that was injecting noise.
+    """
     lf = df.lazy() if isinstance(df, pl.DataFrame) else df
-    
-    # NEW CONTIGUOUS TARGETS
+
     horizon_chunks_seconds = {
         "0_5s": (0, 5),
         "5_10s": (5, 10),
@@ -146,19 +157,17 @@ def engineer_targets(
         "60_300s": (60, 300),
         "300_600s": (300, 600),
         "600_900s": (600, 900),
-
     }
-    
+
     price = pl.col(price_col).cast(pl.Float64)
 
     lf = lf.sort([ticker_col, time_col]).with_columns([
-        price.alias(price_col),
         (pl.col(time_col) + pl.duration(seconds=1)).alias(prediction_time_col),
     ])
 
     target_exprs = []
-    # By anchoring to `t+1` and calculating strictly between window bounds,
-    # overlap and lookahead leakage are mathematically impossible.
+    # Anchored at t+1; returns measured strictly between window bounds so the
+    # chunks are non-overlapping and contain no lookahead leakage.
     for label, (start_s, end_s) in horizon_chunks_seconds.items():
         p_start = price.shift(-(1 + start_s)).over(ticker_col)
         p_end = price.shift(-(1 + end_s)).over(ticker_col)
@@ -166,6 +175,7 @@ def engineer_targets(
 
     lf = lf.with_columns(target_exprs)
     return lf.collect().sort([prediction_time_col, ticker_col])
+
 
 if __name__ == "__main__":
     pass
