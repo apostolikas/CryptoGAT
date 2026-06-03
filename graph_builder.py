@@ -1,98 +1,159 @@
-import numpy as np
-import polars as pl
 import pandas as pd
+import numpy as np
 import torch
-from torch_geometric.data import Data
 
-def compute_correlation_edges(returns_df: pl.DataFrame | pd.DataFrame, threshold: float = 0.7):
+def _compute_cross_correlation(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """
-    Compute correlation edges based on a rolling or static historical window.
-    returns_df: DataFrame where columns are assets and rows are timestamps.
+    Computes the asymmetric cross-correlation matrix between two time-series matrices.
+    A and B must have shape (T_steps, N_assets).
+    Returns shape (N_assets, N_assets) where entry [i, j] is corr(A_i, B_j).
     """
-    if isinstance(returns_df, pl.DataFrame):
-        returns_df = returns_df.to_pandas()
+    if len(A) < 2:
+        return np.zeros((A.shape[1], B.shape[1]))
         
-    corr_matrix = returns_df.corr().abs()
-    edges = []
-    edge_weights = []
+    # Mean center
+    A_c = A - np.nanmean(A, axis=0)
+    B_c = B - np.nanmean(B, axis=0)
     
-    assets = returns_df.columns
-    for i, a1 in enumerate(assets):
-        for j, a2 in enumerate(assets):
-            if i != j:
-                r = corr_matrix.loc[a1, a2]
-                if pd.notna(r) and r > threshold:
-                    edges.append([i, j])
-                    edge_weights.append(r)
-                    
-    if edges:
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-        edge_weight = torch.tensor(edge_weights, dtype=torch.float)
+    # Covariance
+    cov = (A_c.T @ B_c) / (len(A) - 1)
+    
+    # Standard deviations
+    std_A = np.nanstd(A, axis=0)
+    std_B = np.nanstd(B, axis=0)
+    
+    # Cross-correlation (handling div by zero)
+    denominator = np.outer(std_A, std_B)
+    corr = np.divide(cov, denominator, out=np.zeros_like(cov), where=(denominator != 0))
+    
+    return np.nan_to_num(corr)
+
+
+def compute_rich_dynamic_edges(
+    returns_5m: pd.DataFrame, 
+    returns_30m: pd.DataFrame = None, 
+    node_features_t = None, 
+    threshold: float = 0.1
+):
+    """
+    Constructs the dynamic, signed graph for a specific timestamp (A_fast_rolling_t + A_slow_rolling_t).
+    
+    Args:
+        returns_5m: pd.DataFrame of shape (T_5m, N) containing returns for the last 5 minutes.
+        returns_30m: pd.DataFrame of shape (T_30m, N) for the last 30 minutes (optional).
+        node_features_t: pl.DataFrame or pd.DataFrame containing cross-sectional LOB attributes at time t.
+        threshold: Minimum absolute 5m correlation to instantiate an edge.
+    """
+    symbols = returns_5m.columns.tolist()
+    N = len(symbols)
+    
+    # -------------------------------------------------------------------------
+    # 1. 5-Minute Fast Dynamics (Base Correlation & Beta)
+    # -------------------------------------------------------------------------
+    cov_5m = returns_5m.cov().fillna(0).to_numpy()
+    var_5m = returns_5m.var().fillna(1e-12).to_numpy()
+    
+    # Signed and Absolute Correlation
+    corr_signed_5m = returns_5m.corr(method='pearson').fillna(0).to_numpy()
+    corr_abs_5m = np.abs(corr_signed_5m)
+    
+    # Asymmetric Beta: beta[i, j] = Cov(i,j) / Var(j) (Asset i's beta to Asset j)
+    beta_5m = cov_5m / var_5m[None, :] 
+    
+    # Volatility Ratio: vol[i] / vol[j]
+    vol_5m = np.sqrt(var_5m)
+    vol_ratio = vol_5m[:, None] / (vol_5m[None, :] + 1e-12)
+
+    # -------------------------------------------------------------------------
+    # 2. 5-Second Lead-Lag Cross-Correlation (Micro-structural leading)
+    # -------------------------------------------------------------------------
+    if len(returns_5m) > 5:
+        ret_t = returns_5m.to_numpy()[5:]
+        ret_t_minus_5 = returns_5m.shift(5).to_numpy()[5:]
+        lead_lag_5s = _compute_cross_correlation(ret_t, ret_t_minus_5)
     else:
-        edge_index = torch.empty((2, 0), dtype=torch.long)
-        edge_weight = torch.empty(0, dtype=torch.float)
-        
-    return edge_index, edge_weight
+        lead_lag_5s = np.zeros((N, N))
 
-def build_graph(assets: list, macro_anchors: list, sector_map: dict, returns_df: pl.DataFrame | pd.DataFrame = None):
-    """
-    Step 6: Define the Relational Graph Schema
-    assets: list of equity tickers (e.g. ['AAPL', 'NVDA', 'KO', 'PEP'])
-    macro_anchors: list of macro tickers (e.g. ['NQ', 'GC'])
-    sector_map: dict mapping ticker to sector string
-    returns_df: DataFrame of returns for correlation computation
-    """
-    all_nodes = assets + macro_anchors
-    node_to_idx = {node: i for i, node in enumerate(all_nodes)}
-    
-    edge_types = {}
-    
-    # 1. Sector/Industry relation (Equities only)
-    sector_edges = []
-    for i, a1 in enumerate(assets):
-        for j, a2 in enumerate(assets):
-            if i != j and sector_map.get(a1) == sector_map.get(a2):
-                sector_edges.append([node_to_idx[a1], node_to_idx[a2]])
-                
-    if sector_edges:
-        edge_types['sector'] = (
-            torch.tensor(sector_edges, dtype=torch.long).t().contiguous(),
-            torch.ones(len(sector_edges), dtype=torch.float)
-        )
+    # -------------------------------------------------------------------------
+    # 3. 30-Minute Slow Dynamics (Macro Regimes)
+    # -------------------------------------------------------------------------
+    if returns_30m is not None and len(returns_30m) > 30:
+        cov_30m = returns_30m.cov().fillna(0).to_numpy()
+        var_30m = returns_30m.var().fillna(1e-12).to_numpy()
+        beta_30m = cov_30m / var_30m[None, :]
         
-    # 2. Lead-Lag relation (Macro -> Equities)
-    # Index-Beta Edges (NQ -> Equities) and Commodity-Hedge Edges (GC -> Equities)
-    lead_lag_edges = []
-    for macro in macro_anchors:
-        idx_m = node_to_idx[macro]
-        for asset in assets:
-            idx_a = node_to_idx[asset]
-            lead_lag_edges.append([idx_m, idx_a])
-            
-    if lead_lag_edges:
-        edge_types['lead_lag'] = (
-            torch.tensor(lead_lag_edges, dtype=torch.long).t().contiguous(),
-            torch.ones(len(lead_lag_edges), dtype=torch.float) # Weights could be dynamic (beta)
-        )
-        
-    # 3. Correlation relation
-    if returns_df is not None:
-        if isinstance(returns_df, pl.DataFrame):
-            assets_df = returns_df.select(assets)
-        else:
-            assets_df = returns_df[assets]
-            
-        corr_edge_index, corr_edge_weight = compute_correlation_edges(assets_df, threshold=0.7)
-        # Remap indices to global graph indices
-        if corr_edge_index.numel() > 0:
-            for i in range(corr_edge_index.shape[1]):
-                u = assets[corr_edge_index[0, i].item()]
-                v = assets[corr_edge_index[1, i].item()]
-                corr_edge_index[0, i] = node_to_idx[u]
-                corr_edge_index[1, i] = node_to_idx[v]
-            edge_types['correlation'] = (corr_edge_index, corr_edge_weight)
-            
-    return all_nodes, node_to_idx, edge_types
+        ret_30m_t = returns_30m.to_numpy()[30:]
+        ret_30m_minus_30 = returns_30m.shift(30).to_numpy()[30:]
+        lead_lag_30s = _compute_cross_correlation(ret_30m_t, ret_30m_minus_30)
+    else:
+        beta_30m = beta_5m
+        lead_lag_30s = lead_lag_5s
 
-if __name__ == "__main__":
-    pass
+    # -------------------------------------------------------------------------
+    # 4. Cross-Sectional LOB & Residual State Ratios
+    # -------------------------------------------------------------------------
+    spread_z = np.ones((N, N))
+    liq_ratio = np.ones((N, N))
+    res_z = np.zeros((N, N))
+    
+    if node_features_t is not None:
+        # Handles extraction gracefully whether input is Pandas or Polars
+        if "spread_bps" in node_features_t.columns:
+            spreads = node_features_t["spread_bps"].to_numpy() if hasattr(node_features_t["spread_bps"], "to_numpy") else node_features_t["spread_bps"].values
+            spread_z = spreads[:, None] / (spreads[None, :] + 1e-9)
+            
+        if "top5_book_size" in node_features_t.columns:
+            liqs = node_features_t["top5_book_size"].to_numpy() if hasattr(node_features_t["top5_book_size"], "to_numpy") else node_features_t["top5_book_size"].values
+            liq_ratio = liqs[:, None] / (liqs[None, :] + 1e-9)
+            
+        res_cols = [c for c in node_features_t.columns if "kalman_z_score" in c]
+        if res_cols:
+            res_vals = node_features_t[res_cols[0]].to_numpy() if hasattr(node_features_t[res_cols[0]], "to_numpy") else node_features_t[res_cols[0]].values
+            res_z = res_vals[:, None] - res_vals[None, :]
+
+    # -------------------------------------------------------------------------
+    # 5. Graph Assembly & Filtering
+    # -------------------------------------------------------------------------
+    edge_index = []
+    edge_attr = []
+    
+    for i in range(N):
+        for j in range(N):
+            if i != j:
+                if corr_abs_5m[i, j] >= threshold:
+                    attr = [
+                        corr_signed_5m[i, j],
+                        corr_abs_5m[i, j],
+                        beta_5m[i, j],
+                        beta_30m[i, j],
+                        lead_lag_5s[i, j],
+                        lead_lag_30s[i, j],
+                        vol_ratio[i, j],
+                        spread_z[i, j],
+                        liq_ratio[i, j],
+                        res_z[i, j]
+                    ]
+                    edge_index.append([i, j])
+                    edge_attr.append(attr)
+
+    if not edge_index:
+        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 10), dtype=torch.float)
+
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_attr, dtype=torch.float32)
+    edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=10.0, neginf=-10.0)
+
+    return edge_index, edge_attr
+
+def build_static_edges(symbols: list, sector_map: dict):
+    edge_index = []
+    for i, sym_i in enumerate(symbols):
+        for j, sym_j in enumerate(symbols):
+            if i != j:
+                if sector_map.get(sym_i) == sector_map.get(sym_j):
+                    edge_index.append([i, j])
+                    
+    if not edge_index:
+        return torch.empty((2, 0), dtype=torch.long)
+        
+    return torch.tensor(edge_index, dtype=torch.long).t().contiguous()
