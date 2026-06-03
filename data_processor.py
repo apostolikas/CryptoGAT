@@ -14,7 +14,7 @@ MAX_INT_SENTINEL = 9223372036854775807
 def load_equity_data(pattern: str) -> pl.LazyFrame:
     """
     Load raw MBP-10 Parquet files matching the given glob pattern.
-    Deduplicates on (ts_event, symbol, sequence) keeping the last update,
+    Deduplicates on (ts_event, symbol, sequence), keeping the last update,
     drops nulls on ts_event, and sorts by [symbol, ts_event].
     """
     files = glob.glob(pattern)
@@ -34,6 +34,8 @@ def load_equity_data(pattern: str) -> pl.LazyFrame:
 def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
     """
     Aggregate raw ticks into 1-second bars per symbol.
+    Preserves and casts key metrics: depth, size, and price.
+    ts_event is treated as a nanosecond epoch datetime.
     """
     schema_names = lf.collect_schema().names()
 
@@ -42,7 +44,8 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
         pl.from_epoch(pl.col("ts_event"), time_unit="ns").alias("ts_event"),
     )
 
-    # ── 2. Price scaling ─────────────────────────────────────────────────
+    # ── 2. Price and Numeric scaling ─────────────────────────────────────
+    # Adjust prices by dividing by 1e-9 (standard Databento format)
     price_cols = [c for c in schema_names if "px" in c or c == "price"]
     if price_cols:
         lf = lf.with_columns([
@@ -55,15 +58,20 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
             for c in price_cols
         ])
 
-    # Cast size columns to float for downstream arithmetic
-    size_cols = [c for c in schema_names if "sz" in c or c == "size"]
-    if size_cols:
+    # Cast other requested variables to Float64 so they handle downstream math properly
+    numeric_cols = [c for c in ["size", "depth"] if c in schema_names]
+    if numeric_cols:
         lf = lf.with_columns([
-            pl.col(c).cast(pl.Float64).alias(c) for c in size_cols
+            pl.col(c).cast(pl.Float64).alias(c) for c in numeric_cols
         ])
 
     # ── 3. Dynamic 1-second grouping by symbol ───────────────────────────
-    snapshot_cols = [c for c in schema_names if ("px" in c or "sz" in c or "ct" in c)]
+    # Dynamically extract depth, size, and price columns plus any level snapshots (px, sz, ct)
+    additional_preserves = ["depth", "size", "price"]
+    snapshot_cols = [
+        c for c in schema_names 
+        if ("px" in c or "sz" in c or "ct" in c or c in additional_preserves) and c != "ts_event"
+    ]
     snapshot_exprs = [pl.col(c).last().alias(c) for c in snapshot_cols]
 
     lf_grouped = lf.group_by_dynamic(
@@ -99,12 +107,14 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
         min_ts = sym_df["ts_event"].min()
         max_ts = sym_df["ts_event"].max()
 
+        # time_unit="ns" ensures grid types align perfectly to prevent type mismatch crashes on join
         full_grid = pl.DataFrame({
-            "ts_event": pl.datetime_range(min_ts, max_ts, "1s", eager=True),
+            "ts_event": pl.datetime_range(min_ts, max_ts, "1s", time_unit="ns", eager=True),
         }).with_columns(pl.lit(sym).alias("symbol"))
 
         sym_df = full_grid.join(sym_df, on=["ts_event", "symbol"], how="left")
 
+        # forward_fill handles snapshot_cols, which includes depth, size, and price
         sym_df = sym_df.with_columns([
             pl.col(c).forward_fill() for c in snapshot_cols
         ]).with_columns([
@@ -116,14 +126,12 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
     df_out = pl.concat(parts).sort(["symbol", "ts_event"])
     return df_out
 
-import polars as pl
-
 
 def engineer_targets(
     df: pl.DataFrame | pl.LazyFrame,
     time_col: str = "ts_event",
     ticker_col: str = "symbol",
-    price_col: str = "microprice",
+    price_col: str = "price",
     prediction_time_col: str = "predictionTimestamp",
 ) -> pl.DataFrame:
     """Create forward return targets based on the 1-second price."""
@@ -161,4 +169,3 @@ def engineer_targets(
 
 if __name__ == "__main__":
     pass
-
