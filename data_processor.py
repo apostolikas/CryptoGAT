@@ -6,23 +6,42 @@ Step 1: Ingest raw Databento MBP-10 Parquet files and produce strict
 """
 
 import glob
+import os
+import re
 import polars as pl
 
 # Databento uses this as a sentinel for "no level present"
 MAX_INT_SENTINEL = 9223372036854775807
 
 
-def load_equity_data(pattern: str) -> pl.LazyFrame:
+def list_days(pattern: str) -> dict:
+    """Map each trading day -> list of files, parsed from the YYYYMMDD in each
+    filename. Lets the pipeline stream the month one day-block at a time instead
+    of loading every file at once (the source of the OOM). Returns an ordered
+    dict {date_str: [files]} sorted by date."""
+    files = glob.glob(pattern)
+    days = {}
+    for f in files:
+        m = re.search(r"(20\d{6})", os.path.basename(f))
+        if m:
+            days.setdefault(m.group(1), []).append(f)
+    return dict(sorted(days.items()))
+
+
+def load_equity_data(pattern_or_files) -> pl.LazyFrame:
     """
-    Load raw MBP-10 Parquet files matching the given glob pattern.
+    Load raw MBP-10 Parquet files from a glob pattern OR an explicit file list.
     Deduplicates on (ts_event, symbol, sequence), keeping the last update,
     drops nulls on ts_event, and sorts by [symbol, ts_event].
     """
-    files = glob.glob(pattern)
+    if isinstance(pattern_or_files, str):
+        files = glob.glob(pattern_or_files)
+    else:
+        files = list(pattern_or_files)
     if not files:
-        raise FileNotFoundError(f"No files matched pattern: {pattern}")
+        raise FileNotFoundError(f"No files matched: {pattern_or_files}")
 
-    print(f"Planning query execution graph for {len(files)} equity files")
+    print(f"Planning query execution graph for {len(files)} files")
 
     lf = (
         pl.scan_parquet(files)
@@ -99,33 +118,32 @@ def process_raw_data(lf: pl.LazyFrame) -> pl.DataFrame:
     if len(df_agg) == 0:
         return df_agg
 
-    # 4. Fill gaps per symbol on a contiguous 1-second grid
+    # 4. Fill gaps on a contiguous 1-second grid, PER (symbol, day).
+    # Critical for multi-day data: building the grid from global min->max ts
+    # would forward-fill stale books across every overnight/weekend gap,
+    # fabricating hours of constant "bars". Gridding per calendar day keeps the
+    # fill within each session and leaves the cross-day gap empty (as it should).
     flow_cols = [
         "msg_count", "size_added_bid", "size_added_ask",
         "size_canceled_bid", "size_canceled_ask",
         "trade_size_buy", "trade_size_sell",
     ]
 
-    symbols = df_agg["symbol"].unique().sort().to_list()
+    df_agg = df_agg.with_columns(pl.col("ts_event").dt.date().alias("date"))
     parts = []
-
-    for sym in symbols:
-        sym_df = df_agg.filter(pl.col("symbol") == sym)
+    for (sym, day), sym_df in df_agg.group_by(["symbol", "date"], maintain_order=True):
         min_ts = sym_df["ts_event"].min()
         max_ts = sym_df["ts_event"].max()
-
         full_grid = pl.DataFrame({
             "ts_event": pl.datetime_range(min_ts, max_ts, "1s", time_unit="ns", eager=True),
-        }).with_columns(pl.lit(sym).alias("symbol"))
+        }).with_columns([pl.lit(sym).alias("symbol"), pl.lit(day).alias("date")])
 
-        sym_df = full_grid.join(sym_df, on=["ts_event", "symbol"], how="left")
-
+        sym_df = full_grid.join(sym_df, on=["ts_event", "symbol", "date"], how="left")
         sym_df = sym_df.with_columns([
             pl.col(c).forward_fill() for c in snapshot_cols
         ]).with_columns([
             pl.col(c).fill_null(0) for c in flow_cols
         ])
-
         parts.append(sym_df)
 
     df_out = pl.concat(parts).sort(["symbol", "ts_event"])
@@ -161,6 +179,16 @@ def engineer_targets(
 
     price = pl.col(price_col).cast(pl.Float64)
 
+    # Day-local partition: forward returns must stay inside one session. Without
+    # the date in the partition key, shift(-k) at the tail of each day would pull
+    # the NEXT day's opening price -> an overnight-gap return contaminating the
+    # target (and a subtle leak). With it, the last ~900s of each day get null
+    # targets and are dropped downstream, which is correct: you genuinely cannot
+    # observe a 900s-forward return at the close.
+    if "date" not in lf.collect_schema().names():
+        lf = lf.with_columns(pl.col(time_col).dt.date().alias("date"))
+    grp = [ticker_col, "date"]
+
     lf = lf.sort([ticker_col, time_col]).with_columns([
         (pl.col(time_col) + pl.duration(seconds=1)).alias(prediction_time_col),
     ])
@@ -169,8 +197,8 @@ def engineer_targets(
     # Anchored at t+1; returns measured strictly between window bounds so the
     # chunks are non-overlapping and contain no lookahead leakage.
     for label, (start_s, end_s) in horizon_chunks_seconds.items():
-        p_start = price.shift(-(1 + start_s)).over(ticker_col)
-        p_end = price.shift(-(1 + end_s)).over(ticker_col)
+        p_start = price.shift(-(1 + start_s)).over(grp)
+        p_end = price.shift(-(1 + end_s)).over(grp)
         target_exprs.append(((p_end / p_start) - 1.0).alias(f"ret_{label}"))
 
     lf = lf.with_columns(target_exprs)

@@ -18,17 +18,29 @@ class CausalConv1d(nn.Module):
 
 
 class TCNNodeEncoder(nn.Module):
-    def __init__(self, in_channels, hidden_channels):
+    """Dilated causal TCN.
+
+    The receptive field must cover the input sequence or the lookback is
+    wasted. With kernel=3 and dilations (1,2,4,8) the RF is
+    1 + 2*(1+2+4+8) = 31 timesteps, matching a ~30s window. Residual
+    connections + dropout stabilize the deeper stack.
+    """
+
+    def __init__(self, in_channels, hidden_channels, dilations=(1, 2, 4, 8), dropout=0.1):
         super().__init__()
-        self.conv1 = CausalConv1d(in_channels, hidden_channels, kernel_size=3)
-        self.conv2 = CausalConv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=2)
+        self.proj = nn.Conv1d(in_channels, hidden_channels, 1)
+        self.blocks = nn.ModuleList([
+            CausalConv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=d) for d in dilations
+        ])
+        self.norms = nn.ModuleList([nn.BatchNorm1d(hidden_channels) for _ in dilations])
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
         # x: (N, Seq_Len, Features)
-        x = x.transpose(1, 2)            # (N, Features, Seq_Len)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        return x[:, :, -1]               # latest causal state -> (N, H)
+        h = self.proj(x.transpose(1, 2))            # (N, H, Seq_Len)
+        for conv, norm in zip(self.blocks, self.norms):
+            h = h + self.drop(F.relu(norm(conv(h))))  # residual dilated block
+        return h[:, :, -1]                          # latest causal state -> (N, H)
 
 
 class RGATModel(nn.Module):
@@ -57,15 +69,24 @@ class RGATModel(nn.Module):
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
             self.convs.append(GATv2Conv(hidden_channels, hidden_channels, heads=num_heads,
-                                        concat=False, edge_dim=self.edge_in_dim, add_self_loops=False))
+                                        concat=False, edge_dim=self.edge_in_dim,
+                                        add_self_loops=False, dropout=0.1))
             self.norms.append(nn.LayerNorm(hidden_channels))
 
-        self.ffn = nn.Sequential(
+        # Per-horizon heads. Short horizons are driven by microstructure mean
+        # reversion, long horizons by factor/macro momentum; a shared trunk with
+        # one head each lets every horizon weight the representation differently
+        # (and carry its own sign) instead of being forced into one compromise.
+        self.trunk = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_channels, out_channels),
         )
+        self.heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden_channels, hidden_channels // 2), nn.GELU(),
+                          nn.Linear(hidden_channels // 2, 1))
+            for _ in range(out_channels)
+        ])
 
     def _edge_features(self, edge_attr, edge_type):
         onehot = F.one_hot(edge_type, num_classes=self.num_relations).to(edge_attr.dtype)
@@ -82,4 +103,5 @@ class RGATModel(nn.Module):
             h_out = self.convs[i](h, edge_index, edge_attr=edge_feat)
             h = self.norms[i](h + F.elu(h_out))
 
-        return self.ffn(h)               # (N, out_channels)
+        h = self.trunk(h)
+        return torch.cat([head(h) for head in self.heads], dim=1)   # (N, out_channels)

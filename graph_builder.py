@@ -68,10 +68,11 @@ def compute_rich_dynamic_edges(
     corr_signed_5m = np.divide(cov_5m, denom, out=np.zeros_like(cov_5m), where=(denom > 0))
     corr_abs_5m = np.abs(corr_signed_5m)
 
-    # beta[i, j] = cov(i, j) / var(j): j drives i
-    beta_5m = cov_5m / var_safe[None, :]
+    # beta[i, j] = cov(i, j) / var(j): j drives i (clipped: betas can blow up)
+    beta_5m = np.clip(cov_5m / var_safe[None, :], -5.0, 5.0)
     vol_5m = std_5m
-    vol_ratio = vol_5m[:, None] / (vol_5m[None, :] + EPS)
+    # log volatility ratio: symmetric around 0, no heavy right tail
+    vol_ratio = np.log((vol_5m[:, None] + EPS) / (vol_5m[None, :] + EPS))
 
     # equity lead-lag: corr(ret_i(t), ret_j(t-lag))
     if T5 > macro_lag + 1:
@@ -93,7 +94,7 @@ def compute_rich_dynamic_edges(
             var_30s = np.where(var_30 > 0, var_30, 1e-12)
             R30c = _demean(R30)
             cov_30 = (R30c.T @ R30c) / (R30.shape[0] - 1)
-            beta_30m = cov_30 / var_30s[None, :]
+            beta_30m = np.clip(cov_30 / var_30s[None, :], -5.0, 5.0)
             lead_lag_30s = _xcorr(R30[30:], R30[:-30])
         else:
             beta_30m, lead_lag_30s = beta_5m, lead_lag_5s
@@ -105,15 +106,23 @@ def compute_rich_dynamic_edges(
     liq_vec = np.ones(N) if liq_vec is None else np.asarray(liq_vec, dtype=np.float64)
     res_vec = np.zeros(N) if res_vec is None else np.asarray(res_vec, dtype=np.float64)
 
-    spread_z = spread_vec[:, None] / (spread_vec[None, :] + 1e-9)
-    liq_ratio = liq_vec[:, None] / (liq_vec[None, :] + 1e-9)
+    # log-ratios keep these symmetric around 0 instead of a long right tail.
+    # Clamp to non-negative first: a crossed/locked book or a stale forward-fill
+    # can make a raw spread negative, and log of a negative ratio is NaN.
+    sv = np.clip(spread_vec, 0.0, None) + 1e-9
+    lv = np.clip(liq_vec, 0.0, None) + 1e-9
+    spread_z = np.log(sv[:, None] / sv[None, :])
+    liq_ratio = np.log(lv[:, None] / lv[None, :])
     res_z = res_vec[:, None] - res_vec[None, :]
 
     # ---- relation assignment (vectorized; later writes win) ----------------
     rel = np.full((N, N), -1, dtype=np.int64)
     rel[corr_signed_5m >= threshold] = REL_POS
     rel[corr_signed_5m <= -threshold] = REL_NEG
-    rel[np.abs(lead_lag_5s) >= threshold] = REL_LEADLAG
+    # lead-lag correlations are structurally smaller than contemporaneous ones,
+    # so they get a lower threshold or they almost never form an edge.
+    ll_threshold = max(0.08, threshold * 0.5)
+    rel[np.abs(lead_lag_5s) >= ll_threshold] = REL_LEADLAG
 
     if sector_mask is not None:
         rel[sector_mask] = REL_SECTOR
